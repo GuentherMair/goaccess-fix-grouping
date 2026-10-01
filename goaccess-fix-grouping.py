@@ -20,6 +20,8 @@ Usage:
   goaccess-fix-grouping.py --dry-run
   goaccess-fix-grouping.py
   goaccess-fix-grouping.py --method yes --protocol yes '/path/*/db'
+  goaccess-fix-grouping.py --restore
+  goaccess-fix-grouping.py --cleanup
 """
 import argparse
 import glob
@@ -34,7 +36,7 @@ PROPS = "SI32_DB_PROPS.db"
 KEYS = ("append_method", "append_protocol")
 UNKNOWN = 2
 DEFAULT_GLOB = "/var/customers/webs/*/goaccess"
-DB_MARKERS = (PROPS, "I32_DATES.db")
+DB_MARKERS = (PROPS, PROPS + ".bak", "I32_DATES.db")
 
 
 def find_db_dirs(patterns):
@@ -139,6 +141,61 @@ def yesno(s):
     raise argparse.ArgumentTypeError("use yes or no")
 
 
+def restore_backups(dirs, dry_run):
+    """Put SI32_DB_PROPS.db.bak back in place (the backup is consumed)."""
+    counts = {"restored": 0, "skipped": 0, "error": 0}
+    for d in dirs:
+        p = os.path.join(d, PROPS)
+        bak = p + ".bak"
+        if not os.path.exists(bak):
+            print("SKIP   %s (no backup)" % d)
+            counts["skipped"] += 1
+            continue
+        try:
+            read_props(bak)  # never put back something unreadable
+        except (ValueError, struct.error) as ex:
+            print("ERROR  %s: %s" % (bak, ex))
+            counts["error"] += 1
+            continue
+        print("%s %s" % ("WOULD " if dry_run else "RESTORE", d))
+        if not dry_run:
+            os.replace(bak, p)
+        counts["restored"] += 1
+    print("\n%(restored)d restored, %(skipped)d skipped, %(error)d errors" % counts)
+    return 1 if counts["error"] else 0
+
+
+def cleanup_backups(dirs, dry_run):
+    """Delete SI32_DB_PROPS.db.bak files after an interactive confirmation."""
+    baks = [p for p in (os.path.join(d, PROPS + ".bak") for d in dirs)
+            if os.path.exists(p)]
+    if not baks:
+        print("No backups found.")
+        return 0
+    for p in baks:
+        print("%s %s" % ("WOULD DELETE" if dry_run else "DELETE", p))
+    if dry_run:
+        print("\n%d backups would be deleted" % len(baks))
+        return 0
+    try:
+        answer = input("\nDelete these %d backups? After this, --restore is no "
+                       "longer possible. Are you sure? [y/N] " % len(baks))
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Aborted, nothing deleted.")
+        return 1
+    errors = 0
+    for p in baks:
+        try:
+            os.remove(p)
+        except OSError as ex:
+            print("ERROR  %s: %s" % (p, ex))
+            errors += 1
+    print("%d backups deleted, %d errors" % (len(baks) - errors, errors))
+    return 1 if errors else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -151,7 +208,20 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="only report")
     ap.add_argument("--no-backup", action="store_true",
                     help="do not keep SI32_DB_PROPS.db.bak")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--restore", action="store_true",
+                      help="undo a previous fix: move SI32_DB_PROPS.db.bak back into place")
+    mode.add_argument("--cleanup", action="store_true",
+                      help="delete all SI32_DB_PROPS.db.bak backups (asks for confirmation)")
     a = ap.parse_args()
+
+    if a.restore or a.cleanup:
+        dirs = find_db_dirs(a.dirs)
+        if not dirs:
+            sys.exit("No goaccess databases found under: %s" % " ".join(a.dirs))
+        if a.cleanup:
+            return cleanup_backups(dirs, a.dry_run)
+        return restore_backups(dirs, a.dry_run)
 
     if a.method is None or a.protocol is None:
         ref = detect_reference(a.goaccess)
